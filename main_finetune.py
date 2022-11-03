@@ -12,10 +12,12 @@
 import argparse
 import datetime
 import json
+from collections import OrderedDict
 import numpy as np
 import os
 import time
 from pathlib import Path
+from functools import partial
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -35,8 +37,17 @@ from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_vit
+from attacker import NoOpAttacker, PGDAttacker, WTAttacker, Gaussian_Attacker
 
 from engine_finetune import train_one_epoch, evaluate
+
+def to_status(m, status):
+    if hasattr(m, 'batch_type'):
+        m.batch_type = status
+
+to_clean_status = partial(to_status, status='clean')
+to_adv_status = partial(to_status, status='adv')
+to_mix_status = partial(to_status, status='mix')
 
 
 def get_args_parser():
@@ -152,6 +163,12 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # adv-prop
+    parser.add_argument('--attack-iter', help='Adversarial attack iteration', type=int, default=1)
+    parser.add_argument('--attack-epsilon', help='Adversarial attack maximal perturbation', type=float, default=1.0)
+    parser.add_argument('--attack-step-size', help='Adversarial attack step size', type=float, default=1.0)
+    parser.add_argument('--attack-type', help='Adversarial attack type', type=str, default='pgd')
+
     return parser
 
 
@@ -229,6 +246,20 @@ def main(args):
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
     )
+    if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+        if args.attack_type == 'none':
+            attacker = NoOpAttacker()
+        elif args.attack_type == 'gaussian':
+            attacker = Gaussian_Attacker()
+        elif args.attack_type == 'wt':
+            attacker = WTAttacker(args.attack_iter)
+        elif args.attack_type == 'mix':
+            attacker = [WTAttacker(args.attack_iter),
+                        PGDAttacker(args.attack_iter, args.attack_epsilon, args.attack_step_size, prob_start_from_clean=0.2 if not args.eval else 0.0)]
+        else:
+            attacker = PGDAttacker(args.attack_iter, args.attack_epsilon, args.attack_step_size, prob_start_from_clean=0.2 if not args.eval else 0.0)
+        model.set_attacker(attacker)
+        model.set_mixbn(True)
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
@@ -241,6 +272,19 @@ def main(args):
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
 
+        if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+            new_state_dict = OrderedDict()
+            for k, v in checkpoint_model.items():
+                if 'norm' in k and 'weight' in k:
+                    new_state_dict[k[:-6]+'main_bn.weight'] = v.clone().detach()
+                    new_state_dict[k[:-6]+'aux_bn.weight'] = v.clone().detach()
+                elif 'norm' in k and 'bias' in k:
+                    new_state_dict[k[:-4]+'main_bn.bias'] = v.clone().detach()
+                    new_state_dict[k[:-4]+'aux_bn.bias'] = v.clone().detach()
+                else:
+                    new_state_dict[k] = v
+            checkpoint_model = new_state_dict
+
         # interpolate position embedding
         interpolate_pos_embed(model, checkpoint_model)
 
@@ -249,14 +293,24 @@ def main(args):
         print(msg)
 
         if args.global_pool:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            if not(args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14"):
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias',  'fc_norm.weight', 'fc_norm.bias'}
+            else:
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'head.weight', 'head.bias', 'xfm.h0_col', 'xfm.h1_col', 'xfm.h0_row', 'xfm.h1_row', 'ifm.g0_col', 'ifm.g1_col', 'ifm.g0_row', 'ifm.g1_row', 'fc_norm.main_bn.weight', 'fc_norm.main_bn.bias', 'fc_norm.aux_bn.weight', 'fc_norm.aux_bn.bias'}
         else:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+            if not(args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14"):
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'xfm.h0_col', 'xfm.h1_col', 'xfm.h0_row', 'xfm.h1_row', 'ifm.g0_col', 'ifm.g1_col', 'ifm.g0_row', 'ifm.g1_row'}
+            else:
+                assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
         trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
+
+    if args.finetune and not args.eval:
+        test_stats = evaluate(data_loader_val, model, device, args)
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -295,12 +349,15 @@ def main(args):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
+    if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+        model_without_ddp.set_criterion(criterion)
+
     print("criterion = %s" % str(criterion))
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         exit(0)
 
@@ -310,6 +367,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+            model.apply(to_mix_status)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -321,8 +380,9 @@ def main(args):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
-
-        test_stats = evaluate(data_loader_val, model, device)
+        if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+            model.apply(to_clean_status)
+        test_stats = evaluate(data_loader_val, model, device, args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')

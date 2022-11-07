@@ -274,8 +274,11 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
                  decoder_embed_dim=decoder_embed_dim, decoder_depth=decoder_depth, decoder_num_heads=decoder_num_heads,
                  mlp_ratio=mlp_ratio, norm_layer=norm_layer, norm_pix_loss=norm_pix_loss)
 
-        self.eps = 1.0 / 255.0
+        self.eps = 2.0 / 255.0
         self.prob_start_from_clean = 0.2
+        self.embed_dim = embed_dim
+        self.img_size = img_size
+        self.patch_size = patch_size
     
     def random_masking_w_noise(self, x, mask_ratio, noise):
         N, L, D = x.shape  # batch, length, dim
@@ -333,7 +336,9 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
         start_adv = clean_img + start_from_noise_index * init_start
         orig_input = start_adv.detach().requires_grad_(True)   # [0,1]
         
-        N, L, D = imgs.shape  # batch, length, dim
+        # N, L, D = imgs.shape  # batch, length, dim
+        N = imgs.shape[0]
+        L, D = (self.img_size//self.patch_size)**2, self.embed_dim
         noise = torch.rand(N, L, device=imgs.device)  # noise in [0, 1]
         
         # generate adv example
@@ -361,8 +366,8 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
         
         loss = (loss_ori + loss_adv) / 2.
         
-        assert mask == mask_adv and mask_adv == mask_ori
-        assert ids_restore == ids_restore_adv and ids_restore_adv == ids_restore_ori
+        assert torch.equal(mask, mask_adv) and torch.equal(mask_adv, mask_ori)
+        assert torch.equal(ids_restore, ids_restore_adv) and torch.equal(ids_restore_adv, ids_restore_ori)
         
         return loss, loss_ori, loss_adv
 

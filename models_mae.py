@@ -22,6 +22,8 @@ from util.pos_embed import get_2d_sincos_pos_embed
 def to_status(m, status):
     if hasattr(m, 'batch_type'):
         m.batch_type = status
+    if hasattr(m, 'clstoken_type'):
+        m.clstoken_type = status
 
 to_clean_status = partial(to_status, status='clean')
 to_adv_status = partial(to_status, status='adv')
@@ -61,6 +63,20 @@ class MixLayerNorm(nn.Module):
             input1 = self.aux_bn(input[batch_size // 2:])
             input = torch.cat((input0, input1), 0)
         return input
+
+# utils
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    tensors_gather = [torch.ones_like(tensor)
+        for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+
+    output = torch.cat(tensors_gather, dim=0)
+    return output
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -275,10 +291,17 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
                  mlp_ratio=mlp_ratio, norm_layer=norm_layer, norm_pix_loss=norm_pix_loss)
 
         self.eps = 2.0 / 255.0
-        self.prob_start_from_clean = 0.2
+        self.num_iter = 2
+        self.step_size = self.eps / self.num_iter
+        self.prob_start_from_clean = 0.1
         self.embed_dim = embed_dim
         self.img_size = img_size
         self.patch_size = patch_size
+        self.clstoken_type = "clean"
+        self.adv_cls_token = nn.Parameter(self.cls_token.clone().detach())
+        self.epoch = 0
+        self.lamda = 0.0
+        self.T = 0.2
     
     def random_masking_w_noise(self, x, mask_ratio, noise):
         N, L, D = x.shape  # batch, length, dim
@@ -311,7 +334,13 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
         x, mask, ids_restore = self.random_masking_w_noise(x, mask_ratio, noise)
         
         # append cls token
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        if self.clstoken_type == "clean":
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        elif self.clstoken_type == "adv":
+            cls_token = self.adv_cls_token + self.pos_embed[:, :1, :]
+        else:
+            assert self.clstoken_type == "mix"
+            cls_token = 0.5*self.cls_token+0.5*self.adv_cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
 
@@ -320,10 +349,31 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
             x = blk(x)
         x = self.norm(x)
         return x, mask, ids_restore
+    
+    def updata_epoch_and_lamda(self, epoch):
+        self.epoch  = epoch
+        if self.epoch < 30:
+            self.lamda = -0.1
+        elif self.epoch >= 30 and self.epoch < 60:
+            self.lamda = 0.0
+        else:
+            self.lamda = 0.1
+            
+    def contrastive_loss(self, q, k):
+        # normalize
+        q = nn.functional.normalize(q, dim=1)
+        k = nn.functional.normalize(k, dim=1)
+        # gather all targets
+        k = concat_all_gather(k)
+        # Einstein sum is more intuitive
+        logits = torch.einsum('nc,mc->nm', [q, k]) / self.T
+        N = logits.shape[0]  # batch size per GPU
+        labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
+        return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
     def forward(self, imgs, mask_ratio=0.75):
         # attack part
-        self.eval()
+        self.train()
         self.apply(to_adv_status)
         mean_tensor=torch.Tensor(IMAGENET_DEFAULT_MEAN).cuda(imgs.device, non_blocking=True)[None, :, None, None].contiguous()
         std_tensor=torch.Tensor(IMAGENET_DEFAULT_STD).cuda(imgs.device, non_blocking=True)[None, :, None, None].contiguous()
@@ -342,13 +392,22 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
         noise = torch.rand(N, L, device=imgs.device)  # noise in [0, 1]
         
         # generate adv example
-        latent, mask, ids_restore = self.forward_encoder_with_fixed_mask(orig_input, mask_ratio, noise)
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        loss = self.forward_loss(imgs, pred, mask)
-        loss.backward()
-        adv_output = torch.clamp(orig_input + self.eps * torch.sign(orig_input.grad), min=0.0, max=1.0)
-        adv_output = torch.where(adv_output > lower_bound, adv_output, lower_bound)
-        adv_output = torch.where(adv_output < upper_bound, adv_output, upper_bound).detach()
+        adv_output = orig_input.clone().detach().requires_grad_(True)
+        self.apply(to_clean_status)
+        latent_clean, _, _ = self.forward_encoder_with_fixed_mask(clean_img, mask_ratio, noise)
+        self.apply(to_adv_status)
+        for i in range(self.num_iter):
+            adv_output.requires_grad = True
+            latent, mask, ids_restore = self.forward_encoder_with_fixed_mask(adv_output, mask_ratio, noise)
+            # pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+            # loss = self.forward_loss(imgs, pred, mask)
+            ipt = nn.functional.log_softmax(latent, dim=2)
+            tgt = nn.functional.softmax(latent_clean.detach(), dim=2)
+            loss = nn.functional.kl_div(ipt, tgt, reduction="batchmean")
+            loss.backward()
+            adv_output = torch.clamp(adv_output + self.step_size * torch.sign(adv_output.grad), min=0.0, max=1.0)
+            adv_output = torch.where(adv_output > lower_bound, adv_output, lower_bound)
+            adv_output = torch.where(adv_output < upper_bound, adv_output, upper_bound).detach()
         adv_img = ((adv_output-mean_tensor)/std_tensor).detach()
         
         # forward inference
@@ -364,12 +423,28 @@ class AdvMaskedAutoencoderViT(MaskedAutoencoderViT):
         pred_ori = self.forward_decoder(latent_ori, ids_restore_ori)  # [N, L, p*p*3]
         loss_ori = self.forward_loss(imgs, pred_ori, mask_ori)
         
-        loss = (loss_ori + loss_adv) / 2.
+        # loss_cos = torch.mean(nn.functional.cosine_similarity(latent_ori,latent_adv,dim=1))
+        # ipt = nn.functional.log_softmax(latent_adv, dim=1)
+        # tgt = nn.functional.softmax(latent_ori, dim=1)
+        # loss_cos = nn.functional.kl_div(ipt, tgt, reduction="batchmean")
+        loss_cos = self.contrastive_loss(latent_ori.view(latent_ori.shape[0], -1), latent_adv.view(latent_adv.shape[0], -1))
+        
+        loss = (loss_ori + loss_adv) / 2. + 0.05*loss_cos
+        # loss = 0.6*loss_ori + 0.4*loss_adv
         
         assert torch.equal(mask, mask_adv) and torch.equal(mask_adv, mask_ori)
         assert torch.equal(ids_restore, ids_restore_adv) and torch.equal(ids_restore_adv, ids_restore_ori)
         
-        return loss, loss_ori, loss_adv
+        return loss, loss_ori, loss_adv, loss_cos
+
+
+def mae_vit_small_patch16_dec512d8b(**kwargs):
+    model = MaskedAutoencoderViT(
+        patch_size=16, embed_dim=384, depth=12, num_heads=6,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
@@ -394,12 +469,18 @@ def mae_vit_huge_patch14_dec512d8b(**kwargs):
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
+def advmae_vit_small_patch16_dec512d8b(**kwargs):
+    model = AdvMaskedAutoencoderViT(
+        patch_size=16, embed_dim=384, depth=12, num_heads=6,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
 
 def advmae_vit_base_patch16_dec512d8b(**kwargs):
     model = AdvMaskedAutoencoderViT(
         patch_size=16, embed_dim=768, depth=12, num_heads=12,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-        mlp_ratio=4, norm_layer=partial(MixLayerNorm, eps=1e-6), **kwargs)
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
@@ -407,7 +488,7 @@ def advmae_vit_large_patch16_dec512d8b(**kwargs):
     model = AdvMaskedAutoencoderViT(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-        mlp_ratio=4, norm_layer=partial(MixLayerNorm, eps=1e-6), **kwargs)
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
@@ -415,15 +496,17 @@ def advmae_vit_huge_patch14_dec512d8b(**kwargs):
     model = AdvMaskedAutoencoderViT(
         patch_size=14, embed_dim=1280, depth=32, num_heads=16,
         decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
-        mlp_ratio=4, norm_layer=partial(MixLayerNorm, eps=1e-6), **kwargs)
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 # set recommended archs
+mae_vit_small_patch16 = mae_vit_small_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_large_patch16 = mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
 
+advmae_vit_small_patch16 = advmae_vit_small_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 advmae_vit_base_patch16 = advmae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 advmae_vit_large_patch16 = advmae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 advmae_vit_huge_patch14 = advmae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks

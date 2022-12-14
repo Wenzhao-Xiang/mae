@@ -272,18 +272,28 @@ def main(args):
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
 
-        if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint_model.items():
-                if 'norm' in k and 'weight' in k:
-                    new_state_dict[k[:-6]+'main_bn.weight'] = v.clone().detach()
-                    new_state_dict[k[:-6]+'aux_bn.weight'] = v.clone().detach()
-                elif 'norm' in k and 'bias' in k:
-                    new_state_dict[k[:-4]+'main_bn.bias'] = v.clone().detach()
-                    new_state_dict[k[:-4]+'aux_bn.bias'] = v.clone().detach()
-                else:
-                    new_state_dict[k] = v
-            checkpoint_model = new_state_dict
+        # if args.model == "advit_base_patch16" or args.model == "advit_large_patch16" or args.model == "advit_huge_patch14":
+        #     new_state_dict = OrderedDict()
+        #     for k, v in checkpoint_model.items():
+        #         if 'norm' in k and 'weight' in k:
+        #             new_state_dict[k[:-6]+'main_bn.weight'] = v.clone().detach()
+        #             new_state_dict[k[:-6]+'aux_bn.weight'] = v.clone().detach()
+        #         elif 'norm' in k and 'bias' in k:
+        #             new_state_dict[k[:-4]+'main_bn.bias'] = v.clone().detach()
+        #             new_state_dict[k[:-4]+'aux_bn.bias'] = v.clone().detach()
+        #         else:
+        #             new_state_dict[k] = v
+        #     checkpoint_model = new_state_dict
+        
+        if args.model == "vit_base_patch16" or args.model == "vit_large_patch16" or args.model == "vit_huge_patch14":
+            if any([True if 'main_bn.' in k else False for k in checkpoint_model.keys()]):
+                for k in list(checkpoint_model.keys()):
+                    if 'main_bn.' in k:
+                        checkpoint_model[k.replace('main_bn.', '')] = checkpoint_model[k]
+                        del checkpoint_model[k]
+                    if 'aux_bn.' in k:
+                        # checkpoint_model[k.replace('aux_bn.', '')] = checkpoint_model[k]
+                        del checkpoint_model[k]
 
         # interpolate position embedding
         interpolate_pos_embed(model, checkpoint_model)

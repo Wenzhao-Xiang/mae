@@ -28,6 +28,8 @@ def train_one_epoch(model: torch.nn.Module,
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
+    
+    model.module.updata_epoch_and_lamda(epoch)
 
     accum_iter = args.accum_iter
 
@@ -46,7 +48,7 @@ def train_one_epoch(model: torch.nn.Module,
 
         with torch.cuda.amp.autocast():
             if args.model == "advmae_vit_base_patch16" or args.model == "advmae_vit_large_patch16" or args.model == "advmae_vit_huge_patch14":
-                loss, loss_ori, loss_adv = model(samples, mask_ratio=args.mask_ratio)
+                loss, loss_ori, loss_adv, loss_cos = model(samples, mask_ratio=args.mask_ratio)
             else:
                 loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
@@ -54,6 +56,7 @@ def train_one_epoch(model: torch.nn.Module,
         if args.model == "advmae_vit_base_patch16" or args.model == "advmae_vit_large_patch16" or args.model == "advmae_vit_huge_patch14":
             loss_ori_value = loss_ori.item()
             loss_adv_value = loss_adv.item()
+            loss_cos_value = loss_cos.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -71,6 +74,7 @@ def train_one_epoch(model: torch.nn.Module,
         if args.model == "advmae_vit_base_patch16" or args.model == "advmae_vit_large_patch16" or args.model == "advmae_vit_huge_patch14":
             metric_logger.update(loss_ori=loss_ori_value)
             metric_logger.update(loss_adv=loss_adv_value)
+            metric_logger.update(loss_cos=loss_cos_value)
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
@@ -79,6 +83,7 @@ def train_one_epoch(model: torch.nn.Module,
         if args.model == "advmae_vit_base_patch16" or args.model == "advmae_vit_large_patch16" or args.model == "advmae_vit_huge_patch14":
             loss_ori_value_reduce = misc.all_reduce_mean(loss_ori_value)
             loss_adv_value_reduce = misc.all_reduce_mean(loss_adv_value)
+            loss_cos_value_reduce = misc.all_reduce_mean(loss_cos_value)
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
             """ We use epoch_1000x as the x-axis in tensorboard.
             This calibrates different curves when batch size changes.
@@ -88,6 +93,7 @@ def train_one_epoch(model: torch.nn.Module,
             if args.model == "advmae_vit_base_patch16" or args.model == "advmae_vit_large_patch16" or args.model == "advmae_vit_huge_patch14":
                 log_writer.add_scalar('train_loss_ori', loss_ori_value_reduce, epoch_1000x)
                 log_writer.add_scalar('train_loss_adv', loss_adv_value_reduce, epoch_1000x)
+                log_writer.add_scalar('train_loss_cos', loss_cos_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
